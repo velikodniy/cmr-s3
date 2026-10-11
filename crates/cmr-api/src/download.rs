@@ -34,43 +34,34 @@ pub(crate) fn stream(
                     continue;
                 }
             };
-            let (mut position, response_end) = layout(&response, requested, size)?;
-            // The file hasher covers the whole response when no bytes precede this attempt.
-            // Partial downloads and resumed full responses need a separate response hash.
-            let mut response_hasher = (response.status().as_u16() == 200
-                && (state.file_hasher.is_none() || state.next != 0)).then(ContentHasher::new);
-            let failure = loop {
-                let chunk = tokio::time::timeout(defaults::READ_IDLE_TIMEOUT, response.chunk()).await;
-                let chunk = match chunk {
-                    Ok(Ok(Some(chunk))) => chunk,
-                    Ok(Ok(None)) => {
-                        break (position != response_end).then_some(Error::Transport);
+            let result = {
+                let mut content = state.response(&response, requested)?;
+                loop {
+                    let chunk = tokio::time::timeout(defaults::READ_IDLE_TIMEOUT, response.chunk()).await;
+                    match chunk {
+                        Ok(Ok(Some(chunk))) => {
+                            if let Some(selected) = content.select(chunk)? { yield selected; }
+                        }
+                        Ok(Ok(None)) => break content.finish(),
+                        Ok(Err(error)) => break Err(Error::from_http(error)),
+                        Err(_) => break Err(Error::Timeout),
                     }
-                    Ok(Err(error)) => break Some(Error::from_http(error)),
-                    Err(_) => break Some(Error::Timeout),
-                };
-                let chunk_end = position.checked_add(chunk.len() as u64)
-                    .ok_or(Error::Integrity("the body length exceeds the integer limit"))?;
-                if chunk_end > response_end {
-                    Err(Error::Integrity("the body is longer than its declared range"))?;
                 }
-                if let Some(hasher) = &mut response_hasher { hasher.update(&chunk); }
-                if let Some(selected) = state.select(chunk, position, chunk_end) {
-                    yield selected;
-                }
-                position = chunk_end;
             };
             drop(response);
-            if let Some(error) = failure {
-                if !client.recover(&context, &error)
-                    || state.complete() || attempt + 1 == defaults::MAX_ATTEMPTS {
-                    Err(error)?;
+            match result {
+                Ok(final_chunk) => {
+                    if let Some(chunk) = final_chunk { yield chunk; }
+                    break;
                 }
-                transport::delay(attempt, None).await;
-                continue;
+                Err(error) => {
+                    if !client.recover(&context, &error)
+                        || state.complete() || attempt + 1 == defaults::MAX_ATTEMPTS {
+                        Err(error)?;
+                    }
+                    transport::delay(attempt, None).await;
+                }
             }
-            if let Some(chunk) = state.finish(response_hasher)? { yield chunk; }
-            break;
         }
     })
 }
@@ -87,6 +78,7 @@ fn validate_metadata(metadata: crate::CloudObject, size: u64, hash: ContentHash)
 }
 
 struct DownloadState {
+    size: u64,
     next: u64,
     end: u64,
     hash: ContentHash,
@@ -99,6 +91,7 @@ impl DownloadState {
         let next = range.map_or(0, |range| range.start());
         let end = range.map_or(size, |range| range.end() + 1);
         Self {
+            size,
             next,
             end,
             hash,
@@ -117,46 +110,95 @@ impl DownloadState {
             .transpose()
     }
 
-    // The caller checks the response bounds before selecting bytes.
-    fn select(&mut self, chunk: Bytes, position: u64, chunk_end: u64) -> Option<Bytes> {
-        let from = self.next.max(position);
-        let to = self.end.min(chunk_end);
+    fn response(
+        &mut self,
+        response: &Response,
+        requested: Option<ByteRange>,
+    ) -> Result<ResponseState<'_>> {
+        let (position, end) = layout(response, requested, self.size)?;
+        // A complete response needs its own hash if the file hash omits any of its bytes.
+        let hasher = (response.status().as_u16() == 200
+            && (self.file_hasher.is_none() || self.next != 0))
+            .then(ContentHasher::new);
+        Ok(ResponseState {
+            download: self,
+            position,
+            end,
+            hasher,
+        })
+    }
+}
+
+struct ResponseState<'a> {
+    download: &'a mut DownloadState,
+    position: u64,
+    end: u64,
+    hasher: Option<ContentHasher>,
+}
+
+impl ResponseState<'_> {
+    fn select(&mut self, chunk: Bytes) -> Result<Option<Bytes>> {
+        let position = self.position;
+        let chunk_end = position
+            .checked_add(chunk.len() as u64)
+            .ok_or(Error::Integrity(
+                "the body length exceeds the integer limit",
+            ))?;
+        if chunk_end > self.end {
+            return Err(Error::Integrity(
+                "the body is longer than its declared range",
+            ));
+        }
+        if let Some(hasher) = &mut self.hasher {
+            hasher.update(&chunk);
+        }
+        self.position = chunk_end;
+        let from = self.download.next.max(position);
+        let to = self.download.end.min(chunk_end);
         if from >= to {
-            return None;
+            return Ok(None);
         }
         let selected = if from == position && to == chunk_end {
             chunk
         } else {
             chunk.slice((from - position) as usize..(to - position) as usize)
         };
-        if let Some(hasher) = &mut self.file_hasher {
+        if let Some(hasher) = &mut self.download.file_hasher {
             hasher.update(&selected);
         }
-        self.next = to;
-        if self.complete() {
-            self.final_chunk = Some(selected);
-            None
+        self.download.next = to;
+        if self.download.complete() {
+            self.download.final_chunk = Some(selected);
+            Ok(None)
         } else {
-            Some(selected)
+            Ok(Some(selected))
         }
     }
 
-    fn finish(self, response_hasher: Option<ContentHasher>) -> Result<Option<Bytes>> {
-        if !self.complete() {
+    fn finish(self) -> Result<Option<Bytes>> {
+        if self.position != self.end {
+            return Err(Error::Transport);
+        }
+        if !self.download.complete() {
             return Err(Error::Integrity("the requested bytes are incomplete"));
         }
-        if response_hasher.is_some_and(|hasher| hasher.finish() != self.hash) {
+        if self
+            .hasher
+            .is_some_and(|hasher| hasher.finish() != self.download.hash)
+        {
             return Err(Error::Integrity(
                 "the full response hash differs from the metadata",
             ));
         }
         if self
+            .download
             .file_hasher
-            .is_some_and(|hasher| hasher.finish() != self.hash)
+            .take()
+            .is_some_and(|hasher| hasher.finish() != self.download.hash)
         {
             return Err(Error::Integrity("the file hash differs from the metadata"));
         }
-        Ok(self.final_chunk)
+        Ok(self.download.final_chunk.take())
     }
 }
 
@@ -229,6 +271,24 @@ fn parse_content_range(value: &str) -> Result<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn response_headers(size: u64, range: Option<ByteRange>) -> Response {
+        let mut response =
+            http::Response::builder().status(if range.is_some() { 206 } else { 200 });
+        if let Some(range) = range {
+            response = response.header(
+                "content-range",
+                format!("bytes {}-{}/{size}", range.start(), range.end()),
+            );
+        }
+        response
+            .body(reqwest::Body::wrap_stream(futures_util::stream::pending::<
+                Result<Bytes>,
+            >()))
+            .unwrap()
+            .into()
+    }
+
     proptest! {
         #[test]
         fn resuming_requires_the_original_file_identity(
@@ -291,32 +351,26 @@ mod tests {
             let mut state = DownloadState::new(size as u64, ContentHash::compute(&bytes), range);
             let cut = start + cut % (end - start);
             let mut delivered = Vec::new();
-            let mut position = start;
+            let mut content = state.response(&response_headers(size as u64, range), range).unwrap();
             for chunk in bytes[start..cut].chunks(chunk_size) {
-                let chunk_end = position + chunk.len();
-                if let Some(selected) = state.select(Bytes::copy_from_slice(chunk), position as u64, chunk_end as u64) {
+                if let Some(selected) = content.select(Bytes::copy_from_slice(chunk)).unwrap() {
                     delivered.extend_from_slice(&selected);
                 }
-                position = chunk_end;
             }
+            prop_assert!(matches!(content.finish(), Err(Error::Transport)));
             let remaining = state.remaining_range().unwrap().unwrap();
             prop_assert_eq!((remaining.start(), remaining.end()), (cut as u64, end as u64 - 1));
             let (response_start, response_end) = if server_ignores_range { (0, size) } else { (cut, end) };
-            let mut response_hasher = server_ignores_range.then(ContentHasher::new);
-            position = response_start;
+            let response = response_headers(size as u64, (!server_ignores_range).then_some(remaining));
+            let mut content = state.response(&response, Some(remaining)).unwrap();
             for chunk in bytes[response_start..response_end].chunks(chunk_size) {
-                if let Some(hasher) = &mut response_hasher {
-                    hasher.update(chunk);
-                }
-                let chunk_end = position + chunk.len();
-                if let Some(selected) = state.select(Bytes::copy_from_slice(chunk), position as u64, chunk_end as u64) {
+                if let Some(selected) = content.select(Bytes::copy_from_slice(chunk)).unwrap() {
                     delivered.extend_from_slice(&selected);
                 }
-                position = chunk_end;
             }
             // The final bytes remain withheld until length and hash validation succeeds.
             prop_assert!(delivered.len() < end - start);
-            delivered.extend_from_slice(&state.finish(response_hasher).unwrap().unwrap());
+            delivered.extend_from_slice(&content.finish().unwrap().unwrap());
             prop_assert_eq!(delivered, &bytes[start..end]);
         }
 
@@ -329,12 +383,14 @@ mod tests {
             let mut corrupted = bytes.clone();
             corrupted[index % size] ^= 1;
             let mut state = DownloadState::new(size as u64, hash, None);
-            prop_assert!(state.select(corrupted.into(), 0, size as u64).is_none());
-            prop_assert!(matches!(state.finish(None), Err(Error::Integrity(_))));
+            let mut content = state.response(&response_headers(size as u64, None), None).unwrap();
+            prop_assert!(content.select(corrupted.into()).unwrap().is_none());
+            prop_assert!(matches!(content.finish(), Err(Error::Integrity(_))));
 
             let mut incomplete = DownloadState::new(size as u64, hash, None);
-            incomplete.select(Bytes::copy_from_slice(&bytes[..size - 1]), 0, size as u64 - 1);
-            prop_assert!(matches!(incomplete.finish(None), Err(Error::Integrity(_))));
+            let mut content = incomplete.response(&response_headers(size as u64, None), None).unwrap();
+            content.select(Bytes::copy_from_slice(&bytes[..size - 1])).unwrap();
+            prop_assert!(matches!(content.finish(), Err(Error::Transport)));
         }
 
         #[test]
@@ -355,20 +411,34 @@ mod tests {
                 .header("content-range", format!("bytes {actual_start}-{actual_end}/{actual_total}"))
                 .body(reqwest::Body::wrap_stream(futures_util::stream::pending::<Result<Bytes>>()))
                 .unwrap().into();
+            let mut state = DownloadState::new(total, ContentHash::from_bytes([0; 20]), Some(requested));
             if mismatch == 0 {
-                prop_assert_eq!(layout(&response, Some(requested), total).unwrap(), (start, end + 1));
+                prop_assert!(state.response(&response, Some(requested)).is_ok());
             } else {
-                prop_assert!(layout(&response, Some(requested), total).is_err());
+                prop_assert!(state.response(&response, Some(requested)).is_err());
             }
         }
     }
 
     #[test]
     fn empty_downloads_still_require_the_empty_content_hash() {
-        let state = DownloadState::new(0, ContentHash::compute(b""), None);
-        assert!(state.finish(None).unwrap().is_none());
-        let state = DownloadState::new(0, ContentHash::compute(b"a"), None);
-        assert!(matches!(state.finish(None), Err(Error::Integrity(_))));
+        let mut state = DownloadState::new(0, ContentHash::compute(b""), None);
+        assert!(
+            state
+                .response(&response_headers(0, None), None)
+                .unwrap()
+                .finish()
+                .unwrap()
+                .is_none()
+        );
+        let mut state = DownloadState::new(0, ContentHash::compute(b"a"), None);
+        assert!(matches!(
+            state
+                .response(&response_headers(0, None), None)
+                .unwrap()
+                .finish(),
+            Err(Error::Integrity(_))
+        ));
     }
 
     #[test]
@@ -381,43 +451,36 @@ mod tests {
             if corrupt_delivered {
                 prefix[0] ^= 1;
             }
-            assert!(state.select(prefix.into(), 0, 10).is_some());
+            let mut content = state
+                .response(&response_headers(bytes.len() as u64, None), None)
+                .unwrap();
+            assert!(content.select(prefix.into()).unwrap().is_some());
+            assert!(matches!(content.finish(), Err(Error::Transport)));
+            let requested = state.remaining_range().unwrap();
             let mut response = bytes.to_vec();
             if !corrupt_delivered {
                 response[0] ^= 1;
             }
-            let mut hasher = ContentHasher::new();
-            hasher.update(&response);
-            assert!(
-                state
-                    .select(response.into(), 0, bytes.len() as u64)
-                    .is_none()
-            );
-            assert!(matches!(
-                state.finish(Some(hasher)),
-                Err(Error::Integrity(_))
-            ));
+            let mut content = state
+                .response(&response_headers(bytes.len() as u64, None), requested)
+                .unwrap();
+            assert!(content.select(response.into()).unwrap().is_none());
+            assert!(matches!(content.finish(), Err(Error::Integrity(_))));
         }
     }
 
     #[test]
     fn partial_downloads_validate_full_response_bytes_outside_the_range() {
-        let mut state = DownloadState::new(
-            11,
-            ContentHash::compute(b"hello world"),
-            Some(ByteRange::new(0, 4).unwrap()),
-        );
-        let mut response_hasher = ContentHasher::new();
-        response_hasher.update(b"hello wrong");
+        let range = Some(ByteRange::new(0, 4).unwrap());
+        let mut state = DownloadState::new(11, ContentHash::compute(b"hello world"), range);
+        let mut content = state.response(&response_headers(11, None), range).unwrap();
         assert!(
-            state
-                .select(Bytes::from_static(b"hello wrong"), 0, 11)
+            content
+                .select(Bytes::from_static(b"hello wrong"))
+                .unwrap()
                 .is_none()
         );
-        assert!(matches!(
-            state.finish(Some(response_hasher)),
-            Err(Error::Integrity(_))
-        ));
+        assert!(matches!(content.finish(), Err(Error::Integrity(_))));
     }
 
     #[test]
@@ -434,18 +497,32 @@ mod tests {
                 response = response.header(name, value);
             }
             let response = response.body("a").unwrap().into();
+            let mut state = DownloadState::new(1, ContentHash::compute(b"a"), range);
             assert!(matches!(
-                layout(&response, range, 1),
+                state.response(&response, range),
                 Err(Error::Protocol(_))
             ));
         }
         for length in [0, 2] {
             let response = http::Response::new(vec![b'a'; length]).into();
+            let mut state = DownloadState::new(1, ContentHash::compute(b"a"), None);
             assert!(matches!(
-                layout(&response, None, 1),
+                state.response(&response, None),
                 Err(Error::Integrity(_))
             ));
         }
+    }
+
+    #[test]
+    fn overlong_response_chunks_do_not_release_bytes() {
+        let mut state = DownloadState::new(1, ContentHash::compute(b"a"), None);
+        let mut content = state.response(&response_headers(1, None), None).unwrap();
+        assert!(matches!(
+            content.select(Bytes::from_static(b"ab")),
+            Err(Error::Integrity(
+                "the body is longer than its declared range"
+            ))
+        ));
     }
 
     #[test]

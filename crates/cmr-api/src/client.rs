@@ -1389,6 +1389,15 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         let server = MockServer::start_async().await;
         mock_token(&server);
+        let metadata = server.mock(|when, then| {
+            when.method("GET")
+                .path("/file")
+                .query_param("home", "/file");
+            then.status(200).json_body(json!({"status":200,"body":{
+                "home":"/file", "name":"file", "kind":"file", "type":"file",
+                "size":bytes.len(), "hash":ContentHash::compute(bytes)
+            }}));
+        });
         let discovery = server.mock(|when, then| {
             when.path("/d");
             then.status(200).body(server.url("/download"));
@@ -1402,21 +1411,20 @@ mod tests {
         });
         let client = client(&server);
         for range in [None, Some(ByteRange::new(1, 5).unwrap())] {
-            let result = crate::download::stream(
-                client.clone(),
-                "/file".into(),
-                bytes.len() as u64,
-                crate::ContentHash::compute(bytes),
-                range,
-            )
-            .try_collect::<Vec<_>>()
-            .await;
+            let result = client
+                .download("/file", range)
+                .await
+                .unwrap()
+                .stream
+                .try_collect::<Vec<_>>()
+                .await;
             assert!(matches!(
                 result,
                 Err(Error::Protocol("the download uses content encoding"))
             ));
         }
         response.assert_calls(2);
+        metadata.assert_calls(2);
         discovery.assert();
     }
 
@@ -1426,7 +1434,7 @@ mod tests {
         use std::{
             io::{BufRead, BufReader},
             net::TcpListener,
-            sync::{atomic::AtomicBool, mpsc},
+            sync::mpsc,
             thread,
         };
         let bytes = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -1443,13 +1451,13 @@ mod tests {
             let hash = ContentHash::compute(bytes);
             let server = MockServer::start_async().await;
             mock_token(&server);
-            let inspected = Arc::new(AtomicBool::new(false));
-            let inspected_metadata = inspected.clone();
+            let inspections = Arc::new(AtomicUsize::new(0));
+            let inspected_metadata = inspections.clone();
             let metadata = server.mock(|when, then| {
                 when.method("GET").path("/file").query_param("home", "/file");
                 then.respond_with(move |_| {
-                    inspected_metadata.store(true, Ordering::SeqCst);
-                    let hash = if changed { ContentHash::compute(b"another version") } else { hash };
+                    let inspection = inspected_metadata.fetch_add(1, Ordering::SeqCst);
+                    let hash = if changed && inspection > 0 { ContentHash::compute(b"another version") } else { hash };
                     HttpMockResponse::builder().status(200).body(json!({"status":200, "body":{
                         "home":"/file", "name":"file", "kind":"file", "type":"file", "size":bytes.len(), "hash":hash
                     }}).to_string()).build()
@@ -1465,7 +1473,7 @@ mod tests {
                     .header("range", format!("bytes={cut}-{}", end - 1));
                 then.respond_with(move |_| {
                     assert!(
-                        inspected.load(Ordering::SeqCst),
+                        inspections.load(Ordering::SeqCst) >= 2,
                         "metadata must precede the resumed GET"
                     );
                     let reply = HttpMockResponse::builder().status(response_status);
@@ -1533,8 +1541,7 @@ mod tests {
             });
             *client.inner.download.lookup.lock().unwrap() =
                 Some(futures_util::future::ready(Ok(selected)).boxed().shared());
-            let mut stream =
-                crate::download::stream(client, "/file".into(), bytes.len() as u64, hash, range);
+            let mut stream = client.download("/file", range).await.unwrap().stream;
             let first = stream.next().await.unwrap().unwrap();
             assert_eq!(first.as_ref(), &bytes[start..cut]);
             close.send(()).unwrap();
@@ -1562,7 +1569,7 @@ mod tests {
             } else {
                 1
             };
-            metadata.assert_calls(retries);
+            metadata.assert_calls(1 + retries);
             let resumed_requests = if changed { 0 } else { retries };
             discovery.assert_calls(resumed_requests);
             resumed.assert_calls(resumed_requests);
