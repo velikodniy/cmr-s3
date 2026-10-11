@@ -6,6 +6,12 @@ use bytes::Bytes;
 use crate::{ByteRange, CloudObject, Download, ObjectStream, Result, UploadedContent};
 
 /// Cloud operations with automatic authentication and bounded recovery.
+///
+/// The caller must exclusively own the account folders that it mutates.
+/// Operations can run concurrently. Conflicting mutations have no promised order.
+/// To order mutations of the same path or overlapping folders, await each operation before starting the next.
+/// Recoverable write failures repeat within the attempt budget, with the same content, path, and modification time.
+/// If a write outcome remains uncertain, the client inspects metadata before reporting an unresolved write.
 #[async_trait]
 pub trait CloudApi: Send + Sync {
     /// Get file or folder metadata.

@@ -71,8 +71,7 @@ impl Error {
         matches!(self, Self::Http(401 | 403) | Self::Api(401 | 403))
     }
 
-    /// True for failures that allow another read or repeatable upload.
-    /// Writes require a separate decision based on their outcome.
+    /// True for failures that allow another read, upload, or repeatable write.
     pub(crate) fn retryable(&self) -> bool {
         matches!(
             self,

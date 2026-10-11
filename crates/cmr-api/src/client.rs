@@ -158,14 +158,19 @@ impl CloudApi for Client {
         }
         let (hash, reply) = try_join(hash_upload(bytes.clone()), async {
             let reply = self
-                .transfer(&self.inner.upload, Replay::Safe, |url| {
-                    self.inner
-                        .http
-                        .put(url)
-                        .header(header::ACCEPT, "*/*")
-                        .body(bytes.clone())
-                        .timeout(defaults::UPLOAD_TIMEOUT)
-                })
+                .transfer(
+                    &self.inner.upload,
+                    Replay::Safe,
+                    |url| {
+                        self.inner
+                            .http
+                            .put(url)
+                            .header(header::ACCEPT, "*/*")
+                            .body(bytes.clone())
+                            .timeout(defaults::UPLOAD_TIMEOUT)
+                    },
+                    Ok,
+                )
                 .await?;
             protocol::upload_hash(&reply)
         })
@@ -179,15 +184,15 @@ impl CloudApi for Client {
     async fn bind(&self, path: &str, content: UploadedContent, mtime: SystemTime) -> Result<()> {
         protocol::path(path)?;
         match self
-            .write_metadata("bind", path, protocol::bind(path, content, mtime)?)
+            .write_metadata(
+                "bind",
+                path,
+                protocol::bind(path, content, mtime)?,
+                protocol::bind_outcome,
+            )
             .await
-            .map(protocol::bind_outcome)
         {
             Ok(WriteOutcome::Applied) => Ok(()),
-            Ok(WriteOutcome::Rejected(code)) => Err(Error::Binary {
-                operation: "bind",
-                code,
-            }),
             Ok(_) | Err(Error::UnresolvedWrite { .. }) => {
                 self.resolve_bind(path, content, mtime).await
             }
@@ -215,15 +220,15 @@ impl CloudApi for Client {
     async fn mkdir(&self, path: &str) -> Result<()> {
         protocol::path(path)?;
         match self
-            .write_metadata("mkdir", path, protocol::mkdir(path))
+            .write_metadata(
+                "mkdir",
+                path,
+                protocol::mkdir(path),
+                protocol::mkdir_outcome,
+            )
             .await
-            .map(protocol::mkdir_outcome)
         {
             Ok(WriteOutcome::Applied) => Ok(()),
-            Ok(WriteOutcome::Rejected(code)) => Err(Error::Binary {
-                operation: "mkdir",
-                code,
-            }),
             Ok(WriteOutcome::AlreadyExists) => self.resolve_mkdir(path, true).await,
             Ok(_) | Err(Error::UnresolvedWrite { .. }) => self.resolve_mkdir(path, false).await,
             Err(error) => Err(error),
@@ -356,7 +361,8 @@ impl Client {
         operation: &'static str,
         path: &str,
         body: Bytes,
-    ) -> Result<Bytes> {
+        decode: fn(Bytes) -> WriteOutcome,
+    ) -> Result<WriteOutcome> {
         self.transfer(
             &self.inner.metadata,
             Replay::Reconcile { operation, path },
@@ -368,16 +374,21 @@ impl Client {
                     .body(body.clone())
                     .timeout(defaults::CONTROL_TIMEOUT)
             },
+            |reply| match decode(reply) {
+                WriteOutcome::Rejected(code) => Err(Error::Binary { operation, code }),
+                outcome => Ok(outcome),
+            },
         )
         .await
     }
 
-    async fn transfer(
+    async fn transfer<T>(
         &self,
         service: &Service,
         replay: Replay<'_>,
         request: impl Fn(Url) -> RequestBuilder,
-    ) -> Result<Bytes> {
+        decode: impl Fn(Bytes) -> Result<T>,
+    ) -> Result<T> {
         self.retry(replay, || async {
             let (token, selected) = try_join(self.inner.auth.token(), service.get()).await?;
             let request = request(selected.url.clone()).query(&[
@@ -387,7 +398,7 @@ impl Client {
             let (response, retry_after) =
                 transport::buffered(request, defaults::MAX_CONTROL_RESPONSE_BYTES).await;
             Ok(Attempt {
-                response,
+                response: response.and_then(&decode),
                 context: RequestContext {
                     token,
                     service: Some((service, selected)),
@@ -402,28 +413,34 @@ impl Client {
     where
         F: Future<Output = Result<Attempt<'a, T>>>,
     {
+        let mut uncertain = false;
         for attempt in 0..defaults::MAX_ATTEMPTS {
-            // Authentication and discovery own their budgets. A failure before sending is terminal.
-            let Attempt {
-                response,
-                context,
-                retry_after,
-            } = send().await?;
-            match response {
-                Ok(reply) => return Ok(reply),
-                Err(error) => {
+            let (error, retry_after, retry) = match send().await {
+                Ok(Attempt {
+                    response: Ok(reply),
+                    ..
+                }) => return Ok(reply),
+                Ok(Attempt {
+                    response: Err(error),
+                    context,
+                    retry_after,
+                }) => {
+                    uncertain |= error.uncertain();
                     let retry = self.recover(&context, &error);
-                    if let Replay::Reconcile { operation, path } = replay
-                        && error.uncertain()
-                    {
-                        return Err(Self::unresolved(operation, path));
-                    }
-                    if !retry || attempt + 1 == defaults::MAX_ATTEMPTS {
-                        return Err(error);
-                    }
-                    transport::delay(attempt, retry_after).await;
+                    (error, retry_after, retry)
                 }
+                // Authentication and discovery own their budgets. Do not restart them here.
+                Err(error) => (error, None, false),
+            };
+            if !retry || attempt + 1 == defaults::MAX_ATTEMPTS {
+                if let Replay::Reconcile { operation, path } = replay
+                    && uncertain
+                {
+                    return Err(Self::unresolved(operation, path));
+                }
+                return Err(error);
             }
+            transport::delay(attempt, retry_after).await;
         }
         unreachable!("the attempt budget is positive")
     }
@@ -718,37 +735,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncertain_removal_inspects_metadata_without_repeating_the_write() {
-        for metadata_status in [404, 200, 400] {
+    async fn removal_retries_before_reconciling_an_uncertain_outcome() {
+        for (recovers, metadata_status) in [(true, 200), (false, 404), (false, 200), (false, 400)] {
             let server = MockServer::start_async().await;
             mock_token(&server);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let sent = calls.clone();
             let remove = server.mock(|when, then| {
                 when.method("POST")
                     .path("/file/remove")
                     .query_param("access_token", "access")
                     .form_urlencoded_tuple("home", "/target");
-                then.status(503);
+                then.respond_with(move |_| {
+                    let attempt = sent.fetch_add(1, Ordering::SeqCst);
+                    let status = if recovers && attempt > 0 { 200 } else { 503 };
+                    HttpMockResponse::builder()
+                        .status(status)
+                        .body(json!({"status":status,"body":{}}).to_string())
+                        .build()
+                });
             });
+            let reply = json!({
+                "status":metadata_status,"body":{
+                    "home":"/target","name":"target","kind":"folder","type":"folder"
+                }
+            })
+            .to_string();
             let metadata = server.mock(|when, then| {
                 when.method("GET")
                     .path("/file")
                     .query_param("home", "/target");
-                then.status(metadata_status).json_body(json!({
-                    "status": metadata_status, "body": {
-                        "home": "/target", "name": "target", "kind": "folder", "type": "folder",
-                    },
-                }));
+                then.respond_with(move |_| {
+                    assert_eq!(calls.load(Ordering::SeqCst), defaults::MAX_ATTEMPTS);
+                    HttpMockResponse::builder()
+                        .status(metadata_status)
+                        .body(reply.clone())
+                        .build()
+                });
             });
             let result = client(&server).remove("/target").await;
-            if metadata_status == 404 {
+            if recovers || metadata_status == 404 {
                 result.unwrap();
             } else {
                 assert!(
                     matches!(result, Err(Error::UnresolvedWrite { operation: "remove", path }) if path == "/target")
                 );
             }
-            remove.assert();
-            metadata.assert();
+            remove.assert_calls(if recovers { 2 } else { defaults::MAX_ATTEMPTS });
+            metadata.assert_calls(usize::from(!recovers));
         }
     }
 
@@ -796,43 +830,202 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncertain_metadata_writes_reconcile_without_repeating_the_write() {
+    async fn metadata_writes_retry_identical_inputs_before_reconciling() {
         for operation in ["bind", "mkdir"] {
-            let content = UploadedContent {
-                hash: ContentHash::compute(b"a"),
-                size: 1,
-            };
-            let server = MockServer::start_async().await;
-            mock_token(&server);
-            let discovery = server.mock(|when, then| {
-                when.path("/m");
-                then.status(200).body(server.url("/write"));
-            });
-            let write = server.mock(|when, then| {
-                when.method("POST").path("/write");
-                then.status(503);
-            });
-            let metadata = server.mock(|when, then| {
-                when.method("GET").path("/file").query_param("home", "/target");
-                let body = if operation == "bind" {
-                    json!({"home":"/target", "name":"target", "kind":"file", "type":"file", "size":1, "hash":content.hash, "mtime":0})
+            for (recovers, matches) in [(true, false), (false, true), (false, false)] {
+                let content = UploadedContent {
+                    hash: ContentHash::compute(b"a"),
+                    size: 1,
+                };
+                let mtime = SystemTime::UNIX_EPOCH + Duration::from_millis(1500);
+                let expected_body = if operation == "bind" {
+                    protocol::bind("/target", content, mtime).unwrap()
+                } else {
+                    protocol::mkdir("/target")
+                };
+                let server = MockServer::start_async().await;
+                mock_token(&server);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let sent = calls.clone();
+                let discovery = server.mock(|when, then| {
+                    when.path("/m");
+                    then.status(200).body(server.url("/write"));
+                });
+                let write = server.mock(|when, then| {
+                    when.method("POST").path("/write");
+                    then.respond_with(move |request| {
+                        assert_eq!(request.body_ref(), expected_body.as_ref());
+                        let attempt = sent.fetch_add(1, Ordering::SeqCst);
+                        HttpMockResponse::builder()
+                            .status(if recovers && attempt > 0 { 200 } else { 503 })
+                            .body(vec![0])
+                            .build()
+                    });
+                });
+                let body = if operation == "bind" || !matches {
+                    json!({"home":"/target", "name":"target", "kind":"file", "type":"file", "size":1,
+                        "hash": if matches { content.hash } else { ContentHash::compute(b"b") }, "mtime":1})
                 } else {
                     json!({"home":"/target", "name":"target", "kind":"folder", "type":"folder"})
                 };
-                then.status(200).json_body(json!({"status":200, "body":body}));
-            });
-            let client = client(&server);
-            if operation == "bind" {
-                client
-                    .bind("/target", content, SystemTime::UNIX_EPOCH)
-                    .await
-                    .unwrap();
-            } else {
-                client.mkdir("/target").await.unwrap();
+                let reply = json!({"status":200,"body":body}).to_string();
+                let metadata = server.mock(|when, then| {
+                    when.method("GET")
+                        .path("/file")
+                        .query_param("home", "/target");
+                    then.respond_with(move |_| {
+                        assert_eq!(calls.load(Ordering::SeqCst), defaults::MAX_ATTEMPTS);
+                        HttpMockResponse::builder()
+                            .status(200)
+                            .body(reply.clone())
+                            .build()
+                    });
+                });
+                let client = client(&server);
+                let result = if operation == "bind" {
+                    client.bind("/target", content, mtime).await
+                } else {
+                    client.mkdir("/target").await
+                };
+                if recovers || matches {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(result,
+                    Err(Error::UnresolvedWrite { operation: failed, path })
+                        if failed == operation && path == "/target"));
+                }
+                let attempts = if recovers { 2 } else { defaults::MAX_ATTEMPTS };
+                write.assert_calls(attempts);
+                metadata.assert_calls(usize::from(!recovers));
+                discovery.assert_calls(attempts);
             }
-            write.assert();
-            metadata.assert();
-            discovery.assert();
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_rejections_preserve_uncertainty_from_an_earlier_write() {
+        for operation in ["bind", "mkdir"] {
+            for (uncertain, matches) in [(true, true), (true, false), (false, true)] {
+                let content = UploadedContent {
+                    hash: ContentHash::compute(b"a"),
+                    size: 1,
+                };
+                let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+                let server = MockServer::start_async().await;
+                mock_token(&server);
+                let discovery = server.mock(|when, then| {
+                    when.path("/m");
+                    then.status(200).body(server.url("/write"));
+                });
+                let calls = Arc::new(AtomicUsize::new(0));
+                let sent = calls.clone();
+                let write = server.mock(|when, then| {
+                    when.method("POST").path("/write");
+                    then.respond_with(move |_| {
+                        let first = sent.fetch_add(1, Ordering::SeqCst) == 0;
+                        HttpMockResponse::builder()
+                            .status(if first && uncertain { 503 } else { 200 })
+                            .body(vec![254])
+                            .build()
+                    });
+                });
+                let body = if operation == "bind" || !matches {
+                    json!({"home":"/target", "name":"target", "kind":"file", "type":"file", "size":1,
+                        "hash": if matches { content.hash } else { ContentHash::compute(b"b") }, "mtime":1})
+                } else {
+                    json!({"home":"/target", "name":"target", "kind":"folder", "type":"folder"})
+                };
+                let reply = json!({"status":200,"body":body}).to_string();
+                let metadata = server.mock(|when, then| {
+                    when.method("GET")
+                        .path("/file")
+                        .query_param("home", "/target");
+                    then.respond_with(move |_| {
+                        assert_eq!(calls.load(Ordering::SeqCst), 2);
+                        HttpMockResponse::builder()
+                            .status(200)
+                            .body(reply.clone())
+                            .build()
+                    });
+                });
+                let client = client(&server);
+                let result = if operation == "bind" {
+                    client.bind("/target", content, mtime).await
+                } else {
+                    client.mkdir("/target").await
+                };
+                if !uncertain {
+                    assert!(
+                        matches!(result, Err(Error::Binary { operation: failed, code: 254 })
+                        if failed == operation)
+                    );
+                } else if matches {
+                    result.unwrap();
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::UnresolvedWrite { operation: failed, path })
+                        if failed == operation && path == "/target")
+                    );
+                }
+                write.assert_calls(if uncertain { 2 } else { 1 });
+                discovery.assert_calls(if uncertain { 2 } else { 1 });
+                metadata.assert_calls(usize::from(uncertain));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn later_failures_preserve_uncertainty_from_an_earlier_write() {
+        for (uncertain, failure) in [(true, "discovery"), (true, "write"), (false, "write")] {
+            let server = MockServer::start_async().await;
+            mock_token(&server);
+            let write_url = server.url("/write");
+            let lookups = AtomicUsize::new(0);
+            let discovery = server.mock(|when, then| {
+                when.path("/m");
+                then.respond_with(move |_| {
+                    let later = lookups.fetch_add(1, Ordering::SeqCst) > 0;
+                    HttpMockResponse::builder()
+                        .status(if later && failure == "discovery" {
+                            400
+                        } else {
+                            200
+                        })
+                        .body(write_url.as_str())
+                        .build()
+                });
+            });
+            let calls = AtomicUsize::new(0);
+            let write = server.mock(|when, then| {
+                when.method("POST").path("/write");
+                then.respond_with(move |_| {
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    HttpMockResponse::builder()
+                        .status(if first && uncertain { 503 } else { 400 })
+                        .build()
+                });
+            });
+            let metadata = server.mock(|when, then| {
+                when.method("GET")
+                    .path("/file")
+                    .query_param("home", "/target");
+                then.status(200).json_body(json!({"status":200,"body":{
+                    "home":"/target","name":"target","kind":"folder","type":"folder"
+                }}));
+            });
+            let result = client(&server).mkdir("/target").await;
+            if uncertain {
+                result.unwrap();
+            } else {
+                assert!(matches!(result, Err(Error::Http(400))));
+            }
+            write.assert_calls(if uncertain && failure == "write" {
+                2
+            } else {
+                1
+            });
+            discovery.assert_calls(if uncertain { 2 } else { 1 });
+            metadata.assert_calls(usize::from(uncertain));
         }
     }
 

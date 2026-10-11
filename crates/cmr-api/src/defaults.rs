@@ -1,7 +1,7 @@
 //! Operational defaults for the client.
 //!
 //! Each request allows four attempts, including its first attempt.
-//! Only reads and memory uploads repeat after a connection or server failure.
+//! Reads, memory uploads, binding, folder creation, and removal repeat after recoverable failures.
 //! These retries cover timeouts, HTTP or JSON status 408, status 429, and server errors from 500 through 599.
 //! A service response with HTTP status 404 triggers discovery and a retry, including metadata writes.
 //!
@@ -12,8 +12,10 @@
 //! The delay doubles after each failure, up to five seconds.
 //! Jitter chooses a random delay between zero and that limit.
 //! A valid `Retry-After` header sets a minimum delay, capped at 30 seconds.
-//! Writes repeat only after an authentication rejection, a rate limit, or a service HTTP 404.
-//! After an uncertain write, the client reads metadata instead of repeating the write.
+//! Writes also repeat after an authentication rejection or a service HTTP 404.
+//! After write retries end, the client inspects metadata if any submitted attempt remains uncertain.
+//! An uncertain reply that prevents further retries also triggers metadata inspection.
+//! The caller owns its working folders and controls the order of conflicting mutations.
 //!
 //! Downloads have no total deadline because file sizes vary.
 //! The client limits the wait for headers and each body read.
