@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cmr-api"]
+members = ["crates/cmr-api", "crates/cmr-s3"]
 resolver = "2"
 
 [workspace.package]

@@ -1,0 +1,41 @@
+# Copy this file to .cmr-s3/buckets.toml and keep it private (chmod 600).
+# Start with: cmr-s3 serve --config .cmr-s3/buckets.toml
+# Command-line options override environment variables, which override this file.
+# Relative local paths are resolved from the server's working directory.
+
+[server]
+# Cloud Mail.ru account and application password, not your S3 client credentials.
+# You may omit these and use CMR_LOGIN / CMR_PASSWORD instead.
+login = "your@mail.ru"
+password = "your-application-password"
+
+# Path to the master key created by `cmr-s3 keygen`; never replace it for existing data.
+# Back up the key separately from Cloud Mail.ru. Do not paste the key into this file.
+key_file = ".cmr-s3/master.key"
+
+# Private local working directory. Reuse it across restarts to resume multipart uploads.
+state_dir = ".cmr-s3/state"
+
+# Dedicated cloud folder: empty or absent on first use. Run only one server per folder.
+cloud_root = "/cmr-s3"
+
+# Local access only. For containers or remote clients, use a reachable address
+# such as 0.0.0.0:9000 and restrict access or put the endpoint behind a TLS proxy.
+bind = "127.0.0.1:9000"
+
+# Optional settings below show their defaults. Sizes are bytes; durations are seconds.
+# cloud_concurrency = 2               # Simultaneous cloud transfers.
+# staging_bytes = 21474836480         # Total incoming-upload disk allowance (20 GiB).
+# max_requests = 8                   # Simultaneous S3 requests.
+# upload_expiry_seconds = 604800      # Expire inactive multipart uploads after 7 days.
+# orphan_grace_seconds = 86400        # Keep unused cloud content for at least 24 hours.
+# rebuild_index = false              # Set true only to force recovery on startup.
+
+# Each bucket needs a unique name, access key, and secret key.
+# Replace these examples with private credentials used by your S3 clients.
+# Add or remove bucket entries, or change credentials, then restart the server.
+# Removing an entry revokes access but does not delete its stored data.
+[[buckets]]
+name = "backups"
+access_key = "your-backups-access-key"
+secret_key = "your-backups-secret-key"
