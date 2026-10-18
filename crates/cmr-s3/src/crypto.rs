@@ -169,6 +169,16 @@ impl Cipher {
     }
 
     pub fn open(&self, context: &str, mut ciphertext: Vec<u8>) -> Result<Bytes> {
+        let range = self.open_in_place(context, &mut ciphertext)?;
+        Ok(Bytes::from(ciphertext).slice(range))
+    }
+
+    /// Authenticate before exposing a range into a caller-owned record buffer.
+    pub fn open_in_place(
+        &self,
+        context: &str,
+        ciphertext: &mut [u8],
+    ) -> Result<std::ops::Range<usize>> {
         if ciphertext.len() < OVERHEAD || ciphertext.get(..MAGIC.len()) != Some(MAGIC) {
             return Err(Error::Encryption);
         }
@@ -194,7 +204,7 @@ impl Cipher {
                 &tag,
             )
             .map_err(|_| Error::Encryption)?;
-        Ok(Bytes::from(ciphertext).slice(HEADER..end))
+        Ok(HEADER..end)
     }
 }
 

@@ -1084,13 +1084,19 @@ async fn concurrent_conditions_read_snapshots_and_uncertain_publication() {
     put(&backend, "race", Bytes::from_static(b"replacement")).await;
     let mut snapshot_bytes = Vec::new();
     while let Some(chunk) = snapshot.next().await {
-        snapshot_bytes.extend_from_slice(&chunk.unwrap());
+        snapshot_bytes.push(chunk.unwrap());
     }
-    assert_eq!(snapshot_bytes, old);
     drop(snapshot);
     cloud.fail_next_bind("/objects/", true);
     put(&backend, "race", Bytes::from_static(b"reconciled")).await;
     assert_eq!(get(&backend, "race", None).await, b"reconciled");
+    // Retained response chunks must survive subsequent reads and buffer reuse.
+    let mut offset = 0;
+    for chunk in snapshot_bytes {
+        assert_eq!(chunk.as_ref(), &old[offset..offset + chunk.len()]);
+        offset += chunk.len();
+    }
+    assert_eq!(offset, old.len());
     cloud.fail_next_bind("/objects/", false);
     assert!(
         backend

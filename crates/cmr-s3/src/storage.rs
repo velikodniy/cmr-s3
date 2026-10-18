@@ -21,6 +21,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{OwnedRwLockReadGuard, RwLock, Semaphore},
 };
+use zeroize::Zeroize;
 
 use crate::{
     EncryptionKey, Error, Result, checksum,
@@ -85,6 +86,7 @@ pub(crate) struct Store {
     cleanup: tokio::sync::Mutex<()>,
     pub transfers: Arc<Semaphore>,
     readers: Semaphore,
+    buffers: Arc<BufferPool>,
     staged: AtomicU64,
     poisoned: AtomicBool,
     _lock: File,
@@ -199,6 +201,10 @@ impl S3Backend {
             cloud,
             readers: Semaphore::new(config.cloud_concurrency),
             transfers: Arc::new(Semaphore::new(config.cloud_concurrency)),
+            buffers: Arc::new(BufferPool {
+                limit: config.cloud_concurrency,
+                buffers: Mutex::new(Vec::new()),
+            }),
             config,
             cipher,
             index,
@@ -775,12 +781,18 @@ impl Store {
                     .await
                     .expect("open transfer semaphore");
                 let size = remaining.min(chunk_size as u64) as usize;
-                let mut plaintext = Vec::with_capacity(size + OVERHEAD);
+                let mut plaintext = self.buffers.take(size + OVERHEAD);
                 plaintext.resize(size, 0);
                 file.read_exact(&mut plaintext).await?;
                 let relative = format!("data/{id}/{number:08}.bin");
                 let encrypted = self.cipher.seal(&relative, plaintext)?;
-                let content = self.cloud.upload(encrypted.into()).await?;
+                let content = self
+                    .cloud
+                    .upload(Bytes::from_owner(TransferBuffer {
+                        buffer: encrypted,
+                        pool: self.buffers.clone(),
+                    }))
+                    .await?;
                 self.cloud
                     .bind(&self.path(&relative), content, SystemTime::now())
                     .await?;
@@ -828,9 +840,14 @@ impl Store {
                     let begin = number * chunk_size;
                     let expected = (size - begin).min(chunk_size);
                     let encrypted_size = expected as usize + OVERHEAD;
-                    let bytes = collect_into(download.stream, encrypted_size, Vec::with_capacity(encrypted_size)).await?;
-                    let plaintext = store.cipher.open(&relative, bytes)?;
-                    if plaintext.len() as u64 != expected { Err(Error::Encryption)?; }
+                    let buffer = store.buffers.take(encrypted_size);
+                    let mut buffer = collect_into(download.stream, encrypted_size, buffer).await?;
+                    let authenticated = store.cipher.open_in_place(&relative, &mut buffer)?;
+                    if authenticated.len() as u64 != expected { Err(Error::Encryption)?; }
+                    let plaintext = Bytes::from_owner(TransferBuffer {
+                        buffer,
+                        pool: store.buffers.clone(),
+                    }).slice(authenticated);
                     let start = range.start.saturating_sub(begin) as usize;
                     let end = (range.end - begin).min(expected) as usize;
                     let bytes = plaintext.slice(start..end);
@@ -940,6 +957,42 @@ pub(crate) struct Staged {
 impl Drop for Staged {
     fn drop(&mut self) {
         self.store.staged.fetch_sub(self.size, Ordering::AcqRel);
+    }
+}
+
+struct BufferPool {
+    limit: usize,
+    buffers: Mutex<Vec<Vec<u8>>>,
+}
+
+impl BufferPool {
+    fn take(&self, capacity: usize) -> Vec<u8> {
+        let mut buffer = self.buffers.lock().unwrap().pop().unwrap_or_default();
+        buffer.reserve_exact(capacity);
+        buffer
+    }
+}
+
+/// An allocation returns to the pool only after the cloud body or last HTTP slice is dropped.
+struct TransferBuffer {
+    buffer: Vec<u8>,
+    pool: Arc<BufferPool>,
+}
+
+impl AsRef<[u8]> for TransferBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer
+    }
+}
+
+impl Drop for TransferBuffer {
+    fn drop(&mut self) {
+        // Reuse capacity, never retain plaintext between requests.
+        self.buffer.zeroize();
+        let mut buffers = self.pool.buffers.lock().unwrap();
+        if buffers.len() < self.pool.limit {
+            buffers.push(std::mem::take(&mut self.buffer));
+        }
     }
 }
 
