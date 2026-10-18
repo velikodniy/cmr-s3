@@ -3,6 +3,8 @@
 Use Cloud Mail.ru storage with S3 tools such as AWS CLI and rclone.
 Files, bucket names, object names, and metadata are encrypted before being stored in the cloud.
 
+For a container-based setup without a host Rust installation, see [Run with Docker](#run-with-docker).
+
 ## Quick start
 
 You need **Rust 1.99 or later**, a Cloud Mail.ru account, and an application password.
@@ -48,6 +50,36 @@ For example, `CMR_S3_KEY_FILE` or `--key-file` can override `[server].key_file`.
 Relative local paths are resolved from the server's working directory.
 
 For a first run, use a cloud folder that is empty or does not exist. For a nested path, create its parent first.
+
+## Run with Docker
+
+Build locally for a new installation (run as a non-root host user):
+
+```sh
+image=cmr-s3:local
+docker build --tag "$image" .
+mkdir -m 700 .cmr-s3 .cmr-s3/state
+install -m 600 examples/buckets.toml .cmr-s3/buckets.toml
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD/.cmr-s3:/config" "$image" keygen /config/master.key
+```
+
+Edit `.cmr-s3/buckets.toml` with your cloud and bucket credentials, as in the Quick start.
+**Back up `master.key` separately.** For existing data, reuse its key, configuration, and state.
+
+```sh
+docker run --rm --name cmr-s3 --user "$(id -u):$(id -g)" \
+  --read-only --stop-timeout 40 \
+  -p 127.0.0.1:9000:9000 \
+  -v "$PWD/.cmr-s3:/etc/cmr-s3:ro" \
+  -v "$PWD/.cmr-s3/state:/var/lib/cmr-s3" \
+  "$image"
+```
+
+Keep `.cmr-s3` private and persistent. The image sets the internal paths and listen address;
+the published port is host-local only. Use a TLS proxy for remote access.
+After a [release](#releases), you can replace the local image with
+`ghcr.io/velikodniy/cmr-s3:0.1.0` (Linux amd64/arm64).
 
 ## Connect a client
 
@@ -154,3 +186,43 @@ cargo test --offline -p cmr-s3 --test live live_signed_s3_round_trip_and_recover
 ```
 
 The live test writes to a temporary cloud folder. It uses `CMR_TOKEN`, while the server uses `CMR_PASSWORD`.
+
+### CI
+
+Pull requests and pushes to `main` run formatting, warning-free Clippy, and locked workspace tests.
+The release workflow reuses these checks and builds the image only after they pass.
+No Cloud Mail.ru credentials are required or supplied; live cloud and external-client tests remain opt-in.
+
+## Releases
+
+Only stable `vX.Y.Z` Git tags publish images. The tag must match the version in
+`crates/cmr-s3/Cargo.toml` and point to a commit reachable from `main`.
+Prerelease tags do not publish; version mismatches fail the release.
+There is no automatic version bump, server deployment, or publication from ordinary `main` pushes.
+
+1. Update the `cmr-s3` package version and refresh `Cargo.lock` with `cargo check --workspace`.
+2. Commit the release changes to `main` and push it. For the initial release, the existing version is `0.1.0`.
+3. Create and push the matching tag, for example:
+
+   ```sh
+   git tag -a v0.1.0 -m 'release v0.1.0'
+   git push origin v0.1.0
+   ```
+
+The Release workflow validates eligibility and repeats all CI checks before publishing
+`ghcr.io/velikodniy/cmr-s3:0.1.0` and `:latest` as one amd64/arm64 image.
+It uses `docker/build-push-action` for the multi-platform build and publication.
+Only the publishing job receives `packages: write`; authentication uses the repository's `GITHUB_TOKEN`,
+so no personal access token or cloud-account secret is needed.
+
+**First publication:** GitHub creates new container packages as private, even for public repositories.
+In the `cmr-s3` package settings, change its visibility to **Public**.
+If a package with this name already exists, ensure this repository has Actions write access to it.
+See [GitHub's Container registry documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
+Then verify a pull without saved registry credentials:
+
+```sh
+anonymous_config=$(mktemp -d)
+docker --config "$anonymous_config" pull ghcr.io/velikodniy/cmr-s3:0.1.0
+rm -rf "$anonymous_config"
+```

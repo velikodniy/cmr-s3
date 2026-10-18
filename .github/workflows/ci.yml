@@ -1,0 +1,52 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    outputs:
+      version:
+        description: Version of the checked cmr-s3 package
+        value: ${{ jobs.rust.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-1.99.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rust-${{ runner.os }}-${{ runner.arch }}-1.99.0-
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Read package version
+        id: package
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --offline --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "cmr-s3") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint without warnings
+        run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+      - name: Run workspace tests
+        run: cargo test --workspace --locked --offline
