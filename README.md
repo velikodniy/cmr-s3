@@ -66,7 +66,7 @@ docker run --rm --name cmr-s3 --user "$(id -u):$(id -g)" \
 ```
 
 Keep `.cmr-s3` private and persistent. The published port is host-local only.
-After a [release](#releases), you can use `ghcr.io/velikodniy/cmr-s3:0.1.0` instead of the local image (Linux amd64/arm64).
+The published container is `ghcr.io/velikodniy/cmr-s3:0.1.1` for Linux amd64/arm64.
 
 ## Connect a client
 
@@ -80,7 +80,7 @@ After a [release](#releases), you can use `ghcr.io/velikodniy/cmr-s3:0.1.0` inst
 The examples below assume the client runs on the server host.
 For remote access, use the server's address and protect the connection with a TLS proxy. Do not expose the plain HTTP endpoint to the internet.
 
-Current source supports signed empty requests behind proxies such as Caddy that omit `Content-Length: 0`. The server restores zero length only when HTTP framing proves an empty body, with no transfer encoding or declared trailer, before performing normal signature verification. A missing nonzero signed length or an invalid signature is still rejected. The published 0.1.0 container predates this fix; build current source when using affected AWS CLI downloads through a proxy.
+Signed empty requests work behind proxies such as Caddy that omit `Content-Length: 0`. The server restores zero length only when HTTP framing proves an empty body, with no transfer encoding or declared trailer, before performing normal signature verification. A missing nonzero signed length or an invalid signature is still rejected.
 
 ### AWS CLI
 
