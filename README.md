@@ -20,22 +20,15 @@ install -m 600 examples/buckets.toml .cmr-s3/buckets.toml
 ```
 
 **Back up `master.key` separately from Cloud Mail.ru. Without it, your stored data cannot be recovered.**
-The key-generation command will not overwrite an existing key.
-
-`master.key` is an ASCII JSON Web Key (JWK): `kty` is `oct`, and `k` contains the 256-bit secret in unpadded base64url.
-The file is not encrypted; keep it owner-only.
+Keep the key file private.
 
 ### 2. Configure the server and buckets
 
-Edit `.cmr-s3/buckets.toml` using the [example configuration](examples/buckets.toml):
+Edit `.cmr-s3/buckets.toml` using the [commented example](examples/buckets.toml):
 
-- In `[server]`, set your Cloud Mail.ru login, application password, and `key_file` path.
-- Adjust the cloud folder, local state directory, or listen address if needed.
-
-- Keep only the buckets you need, such as `backups`.
-- Replace all example credentials with private values.
-- Give each bucket a unique name, access key, and secret key.
-- Keep these S3 credentials separate from your Cloud Mail.ru application password.
+- Set your Cloud Mail.ru login and application password in `[server]`.
+- Keep the buckets you need and give each a unique name, access key, and secret key.
+  These S3 credentials must differ from your Cloud Mail.ru application password.
 
 The server creates the configured buckets automatically. Each credential pair can access only its own bucket.
 
@@ -44,10 +37,6 @@ The server creates the configured buckets automatically. Each credential pair ca
 ```sh
 ./target/release/cmr-s3 serve --config .cmr-s3/buckets.toml
 ```
-
-Settings are applied in this order: **command-line options → environment variables → config file → defaults**.
-For example, `CMR_S3_KEY_FILE` or `--key-file` can override `[server].key_file`.
-Relative local paths are resolved from the server's working directory.
 
 For a first run, use a cloud folder that is empty or does not exist. For a nested path, create its parent first.
 
@@ -76,10 +65,8 @@ docker run --rm --name cmr-s3 --user "$(id -u):$(id -g)" \
   "$image"
 ```
 
-Keep `.cmr-s3` private and persistent. The image sets the internal paths and listen address;
-the published port is host-local only. Use a TLS proxy for remote access.
-After a [release](#releases), you can replace the local image with
-`ghcr.io/velikodniy/cmr-s3:0.1.0` (Linux amd64/arm64).
+Keep `.cmr-s3` private and persistent. The published port is host-local only.
+After a [release](#releases), you can use `ghcr.io/velikodniy/cmr-s3:0.1.0` instead of the local image (Linux amd64/arm64).
 
 ## Connect a client
 
@@ -92,6 +79,8 @@ After a [release](#releases), you can replace the local image with
 
 The examples below assume the client runs on the server host.
 For remote access, use the server's address and protect the connection with a TLS proxy. Do not expose the plain HTTP endpoint to the internet.
+
+Current source supports signed empty requests behind proxies such as Caddy that omit `Content-Length: 0`. The server restores zero length only when HTTP framing proves an empty body, with no transfer encoding or declared trailer, before performing normal signature verification. A missing nonzero signed length or an invalid signature is still rejected. The published 0.1.0 container predates this fix; build current source when using affected AWS CLI downloads through a proxy.
 
 ### AWS CLI
 
@@ -125,8 +114,6 @@ Then upload your files:
 rclone copy ./backup cmr:backups
 ```
 
-`no_check_bucket` prevents rclone from trying to create a bucket; buckets are managed in the server configuration.
-
 ## Manage and protect your data
 
 - Run **one active server per cloud folder**, even across different hosts.
@@ -152,8 +139,6 @@ rclone copy ./backup cmr:backups
 | Encryption | Always enabled for cloud data. Cloud Mail.ru can still see file sizes and access patterns. |
 | Not supported | Public access, cross-bucket copies, versioning, lifecycle rules, bucket policies, and AWS KMS. |
 | Upload size | Up to 5 GiB per request or multipart part. |
-| Local upload space | 20 GiB by default. |
-| Abandoned multipart uploads | Expire after seven days by default. |
 
 For all server options:
 
@@ -163,9 +148,8 @@ For all server options:
 
 ## Development
 
-The workspace contains `cmr-api` (the Cloud Mail.ru client) and `cmr-s3` (the S3 server).
-Run `cargo fetch --locked` once to download all dependencies, including test dependencies, before using the offline checks below.
-The regular tests run locally without a cloud account; live and external-client tests are skipped by default.
+Run `cargo fetch --locked` once before these checks. Regular tests need no cloud account;
+live cloud and external-client tests are opt-in.
 
 ```sh
 cargo test --workspace --offline
@@ -173,56 +157,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --offline -- -D warnings
 ```
 
-With rclone and Docker Desktop installed, run the client compatibility checks:
-
-```sh
-cargo test --offline -p cmr-s3 --test clients -- --ignored --nocapture
-```
-
-To test against Cloud Mail.ru, set `CMR_LOGIN` and `CMR_TOKEN` to your login and application password, then run:
-
-```sh
-cargo test --offline -p cmr-s3 --test live live_signed_s3_round_trip_and_recovery -- --ignored --nocapture
-```
-
-The live test writes to a temporary cloud folder. It uses `CMR_TOKEN`, while the server uses `CMR_PASSWORD`.
-
-### CI
-
-Pull requests and pushes to `main` run formatting, warning-free Clippy, and locked workspace tests.
-The release workflow reuses these checks and builds the image only after they pass.
-No Cloud Mail.ru credentials are required or supplied; live cloud and external-client tests remain opt-in.
-
 ## Releases
 
-Only stable `vX.Y.Z` Git tags publish images. The tag must match the version in
-`crates/cmr-s3/Cargo.toml` and point to a commit reachable from `main`.
-Prerelease tags do not publish; version mismatches fail the release.
-There is no automatic version bump, server deployment, or publication from ordinary `main` pushes.
-
-1. Update the `cmr-s3` package version and refresh `Cargo.lock` with `cargo check --workspace`.
-2. Commit the release changes to `main` and push it. For the initial release, the existing version is `0.1.0`.
-3. Create and push the matching tag, for example:
-
-   ```sh
-   git tag -a v0.1.0 -m 'release v0.1.0'
-   git push origin v0.1.0
-   ```
-
-The Release workflow validates eligibility and repeats all CI checks before publishing
-`ghcr.io/velikodniy/cmr-s3:0.1.0` and `:latest` as one amd64/arm64 image.
-It uses `docker/build-push-action` for the multi-platform build and publication.
-Only the publishing job receives `packages: write`; authentication uses the repository's `GITHUB_TOKEN`,
-so no personal access token or cloud-account secret is needed.
-
-**First publication:** GitHub creates new container packages as private, even for public repositories.
-In the `cmr-s3` package settings, change its visibility to **Public**.
-If a package with this name already exists, ensure this repository has Actions write access to it.
-See [GitHub's Container registry documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
-Then verify a pull without saved registry credentials:
-
-```sh
-anonymous_config=$(mktemp -d)
-docker --config "$anonymous_config" pull ghcr.io/velikodniy/cmr-s3:0.1.0
-rm -rf "$anonymous_config"
-```
+Stable `vX.Y.Z` tags publish `ghcr.io/velikodniy/cmr-s3:<version>` and `:latest` for Linux amd64/arm64.
+The tag must match the `cmr-s3` package version and point to a commit reachable from `main`.
+See the [release workflow](.github/workflows/release.yml) for publishing details.
