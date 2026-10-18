@@ -396,3 +396,110 @@ async fn real_rclone_sync_metadata_multipart_and_deletion() {
     let _ = stop.send(());
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn signed_empty_get_survives_proxy_length_removal_without_bypassing_authentication() {
+    use bytes::Bytes;
+    use http::{StatusCode, header::CONTENT_LENGTH};
+
+    let state = tempfile::tempdir().unwrap();
+    let backend = S3Backend::open(
+        Arc::new(support::MemoryCloud::default()),
+        StorageConfig {
+            state_dir: state.path().into(),
+            ..Default::default()
+        },
+        EncryptionKey::from_bytes([7; 32]),
+    )
+    .await
+    .unwrap();
+    let buckets = vec![BucketConfig {
+        name: "bucket".into(),
+        access_key: "access".into(),
+        secret_key: "secret".into(),
+    }];
+    let service = cmr_s3::service(backend.clone(), &buckets).await.unwrap();
+    let payload = Bytes::from_static(b"private object");
+    let uploaded = service
+        .call(support::signed::signed(
+            "PUT",
+            "/bucket/object",
+            payload.clone(),
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::OK);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve(listener, backend, &buckets, 2, async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    #[derive(Debug)]
+    enum Framing {
+        Empty,
+        ExplicitZero,
+        Nonempty,
+        Chunked,
+        Trailer,
+    }
+    for (signed_length, secret, framing, expected) in [
+        ("0", "secret", Framing::Empty, StatusCode::OK),
+        ("0", "secret", Framing::ExplicitZero, StatusCode::OK),
+        ("1", "secret", Framing::Empty, StatusCode::FORBIDDEN),
+        ("0", "wrong-secret", Framing::Empty, StatusCode::FORBIDDEN),
+        ("0", "secret", Framing::Nonempty, StatusCode::FORBIDDEN),
+        ("0", "secret", Framing::Chunked, StatusCode::FORBIDDEN),
+        ("0", "secret", Framing::Trailer, StatusCode::FORBIDDEN),
+    ] {
+        let mut request = support::signed::signed_with_credentials(
+            "GET",
+            "/bucket/object",
+            Bytes::new(),
+            &[("content-length", signed_length)],
+            "access",
+            secret,
+        );
+        request.headers_mut().remove(CONTENT_LENGTH);
+        let outgoing = client
+            .get(format!("{endpoint}/bucket/object"))
+            .headers(request.into_parts().0.headers);
+        let outgoing = match framing {
+            Framing::Empty => outgoing,
+            Framing::ExplicitZero => outgoing.header(CONTENT_LENGTH, "0"),
+            Framing::Nonempty => outgoing.body("x"),
+            Framing::Chunked => {
+                let chunks = futures_util::stream::empty::<Result<Bytes, std::io::Error>>();
+                outgoing
+                    .header(http::header::TRANSFER_ENCODING, "chunked")
+                    .body(reqwest::Body::wrap_stream(chunks))
+            }
+            Framing::Trailer => outgoing.header(http::header::TRAILER, "x-checksum"),
+        };
+        let response = outgoing.send().await.unwrap();
+        assert_eq!(response.status(), expected, "framing: {framing:?}");
+        if expected == StatusCode::OK {
+            assert_eq!(response.bytes().await.unwrap(), payload);
+        } else {
+            assert!(
+                response
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("<Code>SignatureDoesNotMatch</Code>")
+            );
+        }
+    }
+    let _ = stop.send(());
+    server.await.unwrap();
+}

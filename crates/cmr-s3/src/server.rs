@@ -1,5 +1,11 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
+use http::{
+    HeaderValue,
+    header::{CONTENT_LENGTH, TRAILER, TRANSFER_ENCODING},
+};
+use hyper::body::Body as _;
+
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
@@ -79,10 +85,20 @@ pub async fn serve(
                 let service = service.clone(); let admission = admission.clone(); let mut stopped = receiver.clone();
                 tasks.spawn(async move {
                     let _connection_permit = connection_permit;
-                    let handler = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                    let handler = hyper::service::service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
                         let service = service.clone(); let admission = admission.clone();
                         async move {
                             let _permit = admission.acquire_owned().await.expect("open request semaphore");
+                            // Go proxies can omit a signed zero length. Restore only proven-empty
+                            // framing; s3s still verifies the original signed header and signature.
+                            if !request.headers().contains_key(CONTENT_LENGTH)
+                                && !request.headers().contains_key(TRANSFER_ENCODING)
+                                && !request.headers().contains_key(TRAILER)
+                                && request.body().is_end_stream()
+                                && request.body().size_hint().exact() == Some(0)
+                            {
+                                request.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+                            }
                             service.call(request.map(s3s::Body::from)).await
                         }
                     });
