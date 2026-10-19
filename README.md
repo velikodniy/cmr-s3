@@ -121,6 +121,8 @@ rclone copy ./backup cmr:backups
 - Keep `.cmr-s3` private: local working files can contain unencrypted data.
 - Back up your bucket configuration as well as your encryption key.
 
+See [Storage layout](docs/layout.md) for cloud files, local state, recovery, and cleanup.
+
 | Task | What to do |
 | --- | --- |
 | Add a bucket or rotate its S3 credentials | Edit `.cmr-s3/buckets.toml` and restart the server. |
